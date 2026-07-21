@@ -315,19 +315,27 @@ async def stop(interaction: discord.Interaction):
     msg2 = await interaction.followup.send("✅ 서버가 정지되었습니다.")
     await msg2.delete(delay=900)
 
-@bot.tree.command(name="restart", description="팰월드 서버를 안전하게 재시작합니다.")
+@bot.tree.command(name="restart", description="팰월드 서버를 안전하게 백업 후 재시작합니다.")
 async def restart(interaction: discord.Interaction):
     if interaction.user.id not in bot.config.admin_ids:
         return await interaction.response.send_message("❌ 권한이 없습니다.", ephemeral=True)
         
-    await interaction.response.send_message("🔄 서버 재시작 시퀀스 가동 (공지 -> 저장 -> 정지 -> 시작)")
+    await interaction.response.send_message("🔄 서버 재시작 시퀀스 가동 (공지 -> 저장 -> 백업 -> 정지 -> 시작)")
     orig = await interaction.original_response()
     await orig.delete(delay=900)
     
     await bot.docker_service.send_rcon("Broadcast Server_is_stopping_for_maintenance")
     await bot.docker_service.send_rcon("Save")
     await asyncio.sleep(5)
+    
     try:
+        # 1. 기동 중인 컨테이너에서 세이브 저장 후 정지 전 백업 수행
+        try:
+            await bot.backup_service.run_backup(bot)
+        except Exception as b_err:
+            logger.error(f"재시작 전 자동 백업 시도 중 오류 발생 (무시하고 정지 절차 진행): {b_err}")
+
+        # 2. 컨테이너 정지 및 재생성 재기동
         container = bot.docker_service.get_container()
         if container:
             container.stop()
@@ -340,7 +348,7 @@ async def restart(interaction: discord.Interaction):
         def _reboot():
             subprocess.run(["docker-compose", "up", "-d", "--force-recreate"], cwd=bot.config.base_path, check=True)
         await asyncio.to_thread(_reboot)
-        logger.info("슬래시 명령어로 인해 palworld-server 가 재시작되었습니다.")
+        logger.info("슬래시 명령어로 인해 백업 완료 후 palworld-server 가 재시작되었습니다.")
     except Exception as e:
         logger.exception(f"슬래시 명령어 restart 도중 예외: {e}")
         
@@ -349,7 +357,7 @@ async def restart(interaction: discord.Interaction):
     data["last_restart"] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
     bot.status_service.save_status(data)
     
-    msg2 = await interaction.followup.send("✅ 서버가 다시 시작되었습니다.")
+    msg2 = await interaction.followup.send("✅ 서버가 안전하게 백업 및 재시작되었습니다.")
     await msg2.delete(delay=900)
 
 @bot.tree.command(name="clean", description="고정된 메시지를 제외하고 채널의 모든 메시지를 삭제합니다.")
@@ -391,6 +399,35 @@ async def manual_backup(interaction: discord.Interaction):
     except Exception as e:
         logger.exception(f"수동 백업 도중 오류가 생겼습니다: {e}")
         await interaction.followup.send(f"❌ 오류 발생: {e}", ephemeral=True)
+
+@bot.tree.command(name="디스크", description="현재 서버의 디스크 용량과 상태를 즉시 확인합니다.")
+async def check_disk_status(interaction: discord.Interaction):
+    if interaction.user.id not in bot.config.admin_ids:
+        return await interaction.response.send_message("❌ 권한이 없습니다.", ephemeral=True)
+    
+    await interaction.response.defer(ephemeral=True)
+    try:
+        disk_percent, used_gb, total_gb = bot.monitor_service.get_disk_usage()
+        color = discord.Color.green() if disk_percent < 80.0 else discord.Color.red()
+        
+        embed = discord.Embed(
+            title="💾 서버 디스크 상태 조회",
+            color=color,
+            timestamp=datetime.datetime.now()
+        )
+        embed.add_field(name="전체 용량", value=f"`{total_gb:.1f} GB`", inline=True)
+        embed.add_field(name="사용 중인 용량", value=f"`{used_gb:.1f} GB`", inline=True)
+        embed.add_field(name="사용률", value=f"`{disk_percent}%`", inline=True)
+        
+        if disk_percent >= 80.0:
+            embed.description = "🚨 **경고**: 디스크 사용량이 80%를 초과하여 정리가 필요할 수 있습니다."
+        else:
+            embed.description = "✅ 디스크 공간이 여유롭고 안전한 상태입니다."
+            
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception as e:
+        logger.error(f"디스크 조회 명령어 실행 중 오류: {e}")
+        await interaction.followup.send(f"❌ 디스크 조회 중 오류가 발생했습니다: {e}", ephemeral=True)
 
 @bot.tree.command(name="설정변경", description="서버 설정(.env) 항목을 일괄 변경하고 서버를 1회 재시작합니다.")
 @app_commands.describe(query="형식: KEY1=VALUE1, KEY2=VALUE2 (예: EXP_RATE=2.0, CATCH_RATE=1.5)")
@@ -583,6 +620,29 @@ async def scheduled_cleanup_task():
     except Exception as e:
         logger.error(f"scheduled_cleanup_task 루프 도중 예외 발생: {e}")
 
+@tasks.loop(hours=12)
+async def scheduled_disk_check_task():
+    """12시간마다 시스템 디스크 잔량을 조회하여 80% 이상 초과 시 경고 메시지를 로그 채널에 전송합니다."""
+    if not bot.is_ready():
+        return
+    try:
+        disk_percent, used_gb, total_gb = bot.monitor_service.get_disk_usage()
+        if disk_percent >= 80.0:
+            log_channel = bot.get_channel(bot.config.log_channel_id)
+            if log_channel:
+                embed = discord.Embed(
+                    title="⚠️ [디스크 용량 경고]",
+                    description=f"서버의 디스크 사용량이 임계치(80%)를 초과했습니다. 원활한 구동을 위해 용량 정리를 고려해 주십시오.",
+                    color=discord.Color.red(),
+                    timestamp=datetime.datetime.now()
+                )
+                embed.add_field(name="현재 사용률", value=f"`{disk_percent}%`", inline=True)
+                embed.add_field(name="상세 점유율", value=f"`{used_gb:.1f} GB` / `{total_gb:.1f} GB`", inline=True)
+                await log_channel.send(embed=embed)
+                logger.warning(f"디스크 사용량 임계 초과 감지: {disk_percent}% ({used_gb:.1f}GB/{total_gb:.1f}GB)")
+    except Exception as e:
+        logger.error(f"scheduled_disk_check_task 루프 내 예외 발생: {e}")
+
 @bot.event
 async def on_ready():
     logger.info(f"봇 로그인 완료: {bot.user.name}")
@@ -599,5 +659,6 @@ async def on_ready():
     if not steam_update_checker_task.is_running(): steam_update_checker_task.start()
     if not scheduled_restart_task.is_running(): scheduled_restart_task.start()
     if not scheduled_cleanup_task.is_running(): scheduled_cleanup_task.start()
+    if not scheduled_disk_check_task.is_running(): scheduled_disk_check_task.start()
 
 bot.run(bot.config.token)

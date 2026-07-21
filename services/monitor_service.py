@@ -67,3 +67,14 @@ class MonitorService:
         total_gb = mem.total / (1024 ** 3)
         ram_display = f"{used_gb:.1f}GB/{total_gb:.0f}GB ({mem.percent}%)"
         return cpu_percent, ram_display, mem.percent
+
+    def get_disk_usage(self):
+        """서버의 디스크 사용량 정보를 퍼센트, 사용량(GB), 전체 용량(GB)으로 반환합니다."""
+        try:
+            disk = psutil.disk_usage('/')
+            total_gb = disk.total / (1024 ** 3)
+            used_gb = disk.used / (1024 ** 3)
+            return disk.percent, used_gb, total_gb
+        except Exception as e:
+            logger.error(f"디스크 사용량 정보 수집 실패: {e}")
+            return 0.0, 0.0, 0.0
