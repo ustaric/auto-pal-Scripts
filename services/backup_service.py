@@ -67,16 +67,41 @@ class BackupService:
             return False, None
 
     async def delete_old_backups(self, bot):
+        """기한이 지난 백업을 정리하되, 가장 최신 백업 시점을 기준으로 이전 24시간 동안의 모든 백업 파일은 안전 보존합니다."""
         now = time.time()
         count = 0
         deleted_files = []
         try:
+            # 1. 백업 폴더 내의 모든 백업 파일 조회 (.tar.gz 형식만)
+            backup_files = []
             for f in os.listdir(self.config.backup_path):
                 f_path = os.path.join(self.config.backup_path, f)
-                if os.stat(f_path).st_mtime < now - (self.config.retention_days * 86400):
+                if os.path.isfile(f_path) and f.endswith(".tar.gz"):
+                    backup_files.append((f, os.stat(f_path).st_mtime))
+            
+            if not backup_files:
+                logger.info("정리할 백업 파일이 존재하지 않습니다.")
+                return
+
+            # 2. 보관된 파일 중 가장 최신에 생성된 백업 시각(T_max)을 구합니다.
+            latest_mtime = max(backup_files, key=lambda x: x[1])[1]
+            
+            # T_max 기준으로 이전 24시간(86400초) 이내의 파일들은 보호 영역으로 지정합니다.
+            protection_threshold = latest_mtime - 86400
+
+            # 3. 파일 삭제 여부 체크 및 만료 정리
+            for f, mtime in backup_files:
+                # 마지막 활성 구간(T_max)으로부터 24시간 이내에 생성된 백업 파일은 무조건 보존 (생략)
+                if mtime >= protection_threshold:
+                    continue
+                
+                # 보호 대상 이외의 구버전 파일 중 설정된 보존 기한(retention_days)을 초과한 경우에만 삭제
+                if mtime < now - (self.config.retention_days * 86400):
+                    f_path = os.path.join(self.config.backup_path, f)
                     os.remove(f_path)
                     count += 1
                     deleted_files.append(f)
+
             if count > 0:
                 data = self.status_service.get_status()
                 data["last_cleanup"] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
@@ -85,8 +110,12 @@ class BackupService:
                 log_channel = bot.get_channel(self.config.log_channel_id)
                 if log_channel: 
                     files_list = "\n".join([f"- `{x}`" for x in deleted_files])
+                    
+                    # 기준 시점을 알기 쉽도록 가독성 높은 일시 스트링으로 변환
+                    session_time_str = datetime.datetime.fromtimestamp(latest_mtime).strftime('%Y-%m-%d %H:%M')
                     await log_channel.send(
                         f"🧹 **[백업 정리 완료]** 보존 기간({self.config.retention_days}일)이 지난 오래된 백업 파일 {count}개를 삭제했습니다.\n"
+                        f"⚠️ **안내**: 가장 최근 백업({session_time_str}) 시점으로부터 이전 24시간 동안 생성된 모든 백업본은 보존 정책에 따라 삭제 대상에서 자동 제외되었습니다.\n"
                         f"🗑️ **삭제 목록:**\n{files_list}"
                     )
                 logger.info(f"보존 기한이 초과된 구버전 백업 {count}개가 자동 디스크 정리되었습니다.")

@@ -56,6 +56,9 @@ class PalworldBot(commands.Bot):
         
         self.empty_timestamp = 0.0
         self.backup_pending_on_empty = False
+        
+        # 대시보드 중복 생성 제어용 비동기 락(Lock) 추가
+        self.dashboard_lock = asyncio.Lock()
 
     async def setup_hook(self):
         status_data = self.status_service.get_status()
@@ -142,131 +145,171 @@ class PalworldBot(commands.Bot):
                 await log_channel.send(f"❌ **[업데이트 실패]** 컨테이너 업데이트 중 오류가 발생했습니다: {e}")
 
     async def refresh_dashboard(self):
-        """현황판 정보 수집 및 GUI 갱신 기능"""
-        channel = self.get_channel(self.config.channel_id)
-        if not channel:
-            try:
-                channel = await self.fetch_channel(self.config.channel_id)
-            except Exception as ch_err:
-                logger.error(f"[CHANNEL ERROR] ID({self.config.channel_id}) 채널 획득 실패: {ch_err}")
-                return
+        """현황판 정보 수집 및 GUI 갱신 기능 (중복 방지 락 및 자가 치유 스캔 적용)"""
+        async with self.dashboard_lock:  # 비동기 중복 진입 완전 차단
+            channel = self.get_channel(self.config.channel_id)
+            if not channel:
+                try:
+                    channel = await self.fetch_channel(self.config.channel_id)
+                except Exception as ch_err:
+                    logger.error(f"[CHANNEL ERROR] ID({self.config.channel_id}) 채널 획득 실패: {ch_err}")
+                    return
 
-        status, players = "OFFLINE", "0 / 0"
-        color = discord.Color.red()
-        current_players = 0
-        
-        container = self.docker_service.get_container()
-        if container and container.status == "running":
-            state = container.attrs.get("State", {})
-            health_status = state.get("Health", {}).get("Status", "none")
+            status, players = "OFFLINE", "0 / 0"
+            color = discord.Color.red()
+            current_players = 0
+            
+            container = self.docker_service.get_container()
+            if container and container.status == "running":
+                state = container.attrs.get("State", {})
+                health_status = state.get("Health", {}).get("Status", "none")
 
-            if health_status == "starting":
-                status = "STARTING"
-                players = "로딩 중..."
-                color = discord.Color.orange()
-                self.server_version = "알 수 없음"
-                self.last_player_count = 0
-            elif health_status == "unhealthy":
-                status = "UNHEALTHY"
-                players = "0 / 0"
-                color = discord.Color.red()
-                self.server_version = "알 수 없음"
-                self.last_player_count = 0
-            else:
-                # API를 통한 세부 상태 조회
-                api_success, version, current_players, max_players = await self.monitor_service.get_server_metrics()
-                if api_success and version != "알 수 없음":
-                    status = "ONLINE"
-                    color = discord.Color.green()
-                    self.server_version = version
-                    players = f"{current_players} / {max_players}"
-                    self.last_player_count = current_players
-                else:
+                if health_status == "starting":
                     status = "STARTING"
                     players = "로딩 중..."
                     color = discord.Color.orange()
                     self.server_version = "알 수 없음"
                     self.last_player_count = 0
-        else:
-            self.server_version = "알 수 없음"
-            self.last_player_count = 0
+                elif health_status == "unhealthy":
+                    status = "UNHEALTHY"
+                    players = "0 / 0"
+                    color = discord.Color.red()
+                    self.server_version = "알 수 없음"
+                    self.last_player_count = 0
+                else:
+                    # API를 통한 세부 상태 조회
+                    api_success, version, current_players, max_players = await self.monitor_service.get_server_metrics()
+                    if api_success and version != "알 수 없음":
+                        status = "ONLINE"
+                        color = discord.Color.green()
+                        self.server_version = version
+                        players = f"{current_players} / {max_players}"
+                        self.last_player_count = current_players
+                    else:
+                        status = "STARTING"
+                        players = "로딩 중..."
+                        color = discord.Color.orange()
+                        self.server_version = "알 수 없음"
+                        self.last_player_count = 0
+            else:
+                self.server_version = "알 수 없음"
+                self.last_player_count = 0
 
-        self.last_status = status
-        data = self.status_service.get_status()
+            self.last_status = status
+            data = self.status_service.get_status()
 
-        # 지능형 이중 동적 자동 백업 로직
-        if status == "ONLINE" and current_players >= 1:
-            now_dt = datetime.datetime.now()
-            required_interval = self.backup_service.get_backup_interval(now_dt)
-            last_backup_ts = data.get("last_backup_timestamp", 0.0)
-            
-            if time.time() - last_backup_ts >= required_interval:
-                await self.backup_service.run_backup(self)
-                data = self.status_service.get_status()
-
-        # 메모리 한계치 초과 시 안전 재기동 조치
-        cpu_percent, ram_display, mem_percent = self.monitor_service.get_system_resources()
-        if mem_percent > self.config.re_limit:
-            current_time = time.time()
-            if current_time - self.last_restart_time > 1800:
-                self.last_restart_time = current_time
-                await self.docker_service.send_rcon("Broadcast Server_is_stopping_for_maintenance")
-                await self.docker_service.send_rcon("Save")
-                await asyncio.sleep(5)
+            # 지능형 이중 동적 자동 백업 로직
+            if status == "ONLINE" and current_players >= 1:
+                now_dt = datetime.datetime.now()
+                required_interval = self.backup_service.get_backup_interval(now_dt)
+                last_backup_ts = data.get("last_backup_timestamp", 0.0)
                 
-                try:
-                    c = self.docker_service.get_container()
-                    if c:
-                        c.stop()
+                if time.time() - last_backup_ts >= required_interval:
+                    await self.backup_service.run_backup(self)
+                    data = self.status_service.get_status()
+
+            # 메모리 한계치 초과 시 안전 재기동 조치
+            cpu_percent, ram_display, mem_percent = self.monitor_service.get_system_resources()
+            if mem_percent > self.config.re_limit:
+                current_time = time.time()
+                if current_time - self.last_restart_time > 1800:
+                    self.last_restart_time = current_time
+                    await self.docker_service.send_rcon("Broadcast Server_is_stopping_for_maintenance")
+                    await self.docker_service.send_rcon("Save")
                     await asyncio.sleep(5)
                     
-                    def _recreate():
-                        subprocess.run(["docker-compose", "up", "-d", "--force-recreate"], cwd=self.config.base_path, check=True)
-                    await asyncio.to_thread(_recreate)
+                    try:
+                        c = self.docker_service.get_container()
+                        if c:
+                            c.stop()
+                        await asyncio.sleep(5)
+                        
+                        def _recreate():
+                            subprocess.run(["docker-compose", "up", "-d", "--force-recreate"], cwd=self.config.base_path, check=True)
+                        await asyncio.to_thread(_recreate)
+                    except Exception as e:
+                        logger.error(f"메모리 초과 자동 재시작 처리 중 오류: {e}")
+                    
+                    data = self.status_service.get_status()
+                    data["last_restart"] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
+                    self.status_service.save_status(data)
+
+            # UI Embed 생성 함수 분리 적용
+            embed = create_dashboard_embed(
+                server_name=self.config.server_name,
+                server_ip=self.config.server_ip,
+                server_port=self.config.server_port,
+                status=status,
+                players=players,
+                cpu_percent=cpu_percent,
+                ram_display=ram_display,
+                last_backup=data.get('last_backup', '-'),
+                last_restart=data.get('last_restart', '-'),
+                version=self.server_version,
+                color=color
+            )
+
+            update_state = data.get("update_available", False)
+            view = ServerControlView(update_available=update_state)
+            
+            msg_id = data.get("msg_id")
+            msg = None
+
+            # 1. 저장된 msg_id가 존재할 때 유효성 확인
+            if msg_id:
+                try:
+                    msg = await channel.fetch_message(msg_id)
+                except discord.NotFound:
+                    logger.info("저장된 ID의 현황판을 채널에서 찾을 수 없습니다. 자가 복구 스캔을 개시합니다.")
+                    msg = None
                 except Exception as e:
-                    logger.error(f"메모리 초과 자동 재시작 처리 중 오류: {e}")
-                
-                data = self.status_service.get_status()
-                data["last_restart"] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
-                self.status_service.save_status(data)
+                    logger.error(f"기존 현황판 조회 중 에러 발생: {e}")
+                    msg = None
 
-        # UI Embed 생성 함수 분리 적용
-        embed = create_dashboard_embed(
-            server_name=self.config.server_name,
-            server_ip=self.config.server_ip,
-            server_port=self.config.server_port,
-            status=status,
-            players=players,
-            cpu_percent=cpu_percent,
-            ram_display=ram_display,
-            last_backup=data.get('last_backup', '-'),
-            last_restart=data.get('last_restart', '-'),
-            version=self.server_version,
-            color=color
-        )
+            # 2. 자가 치유(Self-Healing) 알고리즘 적용: msg_id가 없거나 메시지 분실 시 채널 직접 탐색
+            if msg is None:
+                try:
+                    found_dashboard_messages = []
+                    async for history_msg in channel.history(limit=50):
+                        # 본인이 작성한 메시지 중 대시보드 형식의 임베드 제목 확인
+                        if history_msg.author.id == self.user.id and history_msg.embeds:
+                            embed_title = history_msg.embeds[0].title
+                            if embed_title and (self.config.server_name in embed_title):
+                                found_dashboard_messages.append(history_msg)
+                    
+                    if found_dashboard_messages:
+                        # 가장 최근의 메시지를 대시보드로 지정하고 DB 동기화
+                        msg = found_dashboard_messages[0]
+                        data["msg_id"] = msg.id
+                        self.status_service.save_status(data)
+                        logger.info(f"채널 기록 스캔을 통해 기존 대시보드를 안정적으로 식별하고 연결했습니다. (ID: {msg.id})")
+                        
+                        # 중복된 이전 버전의 현황판 메시지는 정리 (청소 정책)
+                        for duplicate_msg in found_dashboard_messages[1:]:
+                            try:
+                                await duplicate_msg.delete()
+                                logger.info(f"중복 확인된 옛날 현황판 메시지를 삭제했습니다. (ID: {duplicate_msg.id})")
+                            except Exception:
+                                pass
+                except Exception as scan_err:
+                    logger.error(f"현황판 자가 복구를 위한 역사 스캔 실패: {scan_err}")
 
-        update_state = data.get("update_available", False)
-        view = ServerControlView(update_available=update_state)
-        msg_id = data.get("msg_id")
-        
-        if msg_id:
-            try:
-                msg = await channel.fetch_message(msg_id)
-                await msg.edit(embed=embed, view=view)
-            except Exception:
+            # 3. 데이터 송수신 처리 (기존 것 수정 혹은 최초 신규 빌드)
+            if msg:
+                try:
+                    await msg.edit(embed=embed, view=view)
+                except Exception as edit_err:
+                    logger.error(f"식별된 현황판 수정 실패, 신규 생성을 진행합니다: {edit_err}")
+                    msg = None
+
+            if msg is None:
                 try:
                     msg = await channel.send(embed=embed, view=view)
                     data["msg_id"] = msg.id
                     self.status_service.save_status(data)
+                    logger.info(f"현황판 신규 생성 완료. (ID: {msg.id})")
                 except Exception as e:
-                    logger.error(f"현황판 임베드 메시지 재발송 도중 에러: {e}")
-        else:
-            try:
-                msg = await channel.send(embed=embed, view=view)
-                data["msg_id"] = msg.id
-                self.status_service.save_status(data)
-            except Exception as e:
-                logger.error(f"현황판 최초 발송 중 에러 발생: {e}")
+                    logger.error(f"현황판 최초 발송 및 저장 실패: {e}")
 
 bot = PalworldBot()
 
