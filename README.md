@@ -234,3 +234,27 @@ sudo systemctl restart palbot.service
    - 게임 서버를 디스코드 상에서 자유롭게 끄고 켤 수 있습니다. (관리자 전용)
 ```
 ---_
+
+/home/user/palworld-bot/ (또는 BASE_PATH로 설정한 경로)
+│
+├── main.py
+├── .env (게임 설정 파일)
+├── env (봇 설정 파일)
+│
+├── utils/
+│   ├── __init__.py
+│   ├── logger.py
+│   └── validator.py
+│
+├── services/
+│   ├── __init__.py
+│   ├── config_service.py
+│   ├── status_service.py
+│   ├── docker_service.py
+│   ├── backup_service.py
+│   └── monitor_service.py
+│
+└── bot/
+    ├── __init__.py
+    ├── embeds.py
+    └── views.py
