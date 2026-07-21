@@ -26,11 +26,21 @@ class BackupService:
         return 60 * 60
 
     async def run_backup(self, bot):
-        """서버 데이터를 안전하게 아카이빙 압축 처리하고 결과를 로그 채널에 송신합니다."""
+        """서버 데이터를 안전하게 저장하고 아카이빙 압축 처리한 뒤 결과를 로그 채널에 송신합니다."""
         now = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
         target = f"{self.config.backup_path}/{now}.tar.gz"
         
         try:
+            # [안정화 개선] 압축 전에 RCON 'Save' 명령을 내릴 수 있는 상태(서버 ONLINE)인지 판별하여
+            # 활성 세이브 데이터를 완벽하게 디스크로 강제 플러시(Force Flush)합니다.
+            if bot.last_status == "ONLINE":
+                try:
+                    logger.info("안전한 백업 생성을 위해 RCON Save 명령어를 전송합니다...")
+                    await bot.docker_service.send_rcon("Save")
+                    await asyncio.sleep(3)  # 디스크 쓰기 작업 완료를 위해 3초 대기
+                except Exception as rcon_err:
+                    logger.warning(f"RCON 저장 명령어 전송 실패 (백업 작업을 계속 강행합니다): {rcon_err}")
+
             # docker exec 작업 비동기 격리 실행
             def _exec_backup():
                 subprocess.run(
