@@ -41,16 +41,8 @@ class BackupService:
                 except Exception as rcon_err:
                     logger.warning(f"RCON 저장 명령어 전송 실패 (백업 작업을 계속 강행합니다): {rcon_err}")
 
-            # docker exec 작업 비동기 격리 실행
-            def _exec_backup():
-                subprocess.run(
-                    ["docker", "exec", "palworld-server", "backup"],
-                    check=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True
-                )
-            await asyncio.to_thread(_exec_backup)
+            # [수정] 도커 내부 중복 백업 명령을 완전히 제거하고, 
+            # 호스트 단의 파이썬 tar.gz 아카이빙 작업만 실행하여 오류를 방지합니다.
 
             # 압축 아카이빙 비동기 격리 실행 (I/O 루프 병목 차단)
             def _create_tar():
