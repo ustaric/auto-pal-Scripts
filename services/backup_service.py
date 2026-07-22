@@ -26,43 +26,67 @@ class BackupService:
         return 60 * 60
 
     async def run_backup(self, bot):
-        """서버 데이터를 안전하게 저장하고 아카이빙 압축 처리한 뒤 결과를 로그 채널에 송신합니다."""
+        """서버 데이터를 안전하게 저장하고 아카이빙 압축 처리한 뒤 결과를 구글 드라이브로 전송하고 로그를 송신합니다."""
         now = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
         target = f"{self.config.backup_path}/{now}.tar.gz"
         
         try:
-            # [안정화 개선] 압축 전에 RCON 'Save' 명령을 내릴 수 있는 상태(서버 ONLINE)인지 판별하여
-            # 활성 세이브 데이터를 완벽하게 디스크로 강제 플러시(Force Flush)합니다.
+            # 1. RCON 'Save' 명령 전송 및 플러시 대기
             if bot.last_status == "ONLINE":
                 try:
                     logger.info("안전한 백업 생성을 위해 RCON Save 명령어를 전송합니다...")
                     await bot.docker_service.send_rcon("Save")
-                    await asyncio.sleep(3)  # 디스크 쓰기 작업 완료를 위해 3초 대기
+                    await asyncio.sleep(3)  # 디스크 쓰기 완료 대기
                 except Exception as rcon_err:
                     logger.warning(f"RCON 저장 명령어 전송 실패 (백업 작업을 계속 강행합니다): {rcon_err}")
 
-            # [수정] 도커 내부 중복 백업 명령을 완전히 제거하고, 
-            # 호스트 단의 파이썬 tar.gz 아카이빙 작업만 실행하여 오류를 방지합니다.
-
-            # 압축 아카이빙 비동기 격리 실행 (I/O 루프 병목 차단)
+            # 2. 로컬 압축 파일(.tar.gz) 비동기 생성
             def _create_tar():
                 with tarfile.open(target, "w:gz") as tar:
                     tar.add(self.config.save_data_path, arcname="Saved")
             await asyncio.to_thread(_create_tar)
             
+            logger.info(f"로컬 백업 파일 생성 완료: {target}")
+
+            # 3. Rclone을 사용한 구글 드라이브 'backup' 폴더 업로드 (비동기 서브프로세스 실행)
+            # 봇의 메인 루프가 블로킹되지 않도록 create_subprocess_exec를 사용합니다.
+            logger.info("Rclone 구글 드라이브 업로드를 시작합니다...")
+            rclone_proc = await asyncio.create_subprocess_exec(
+                'rclone', 'copy', target, 'gdrive:backup',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            # 업로드 프로세스가 끝날 때까지 비동기 대기
+            stdout, stderr = await rclone_proc.communicate()
+            
+            if rclone_proc.returncode == 0:
+                logger.info("구글 드라이브 업로드에 성공했습니다.")
+                gdrive_status = "구글 드라이브 전송 완료"
+            else:
+                error_msg = stderr.decode().strip()
+                logger.error(f"Rclone 전송 실패: {error_msg}")
+                gdrive_status = f"구글 드라이브 전송 실패 ({error_msg})"
+
+            # 4. 상태 데이터 업데이트
             data = self.status_service.get_status()
             data["last_backup"] = f"{now}.tar.gz"
             data["last_backup_timestamp"] = time.time()
             self.status_service.save_status(data)
             
+            # 5. 디스코드 채널 알림 발송
             log_channel = bot.get_channel(self.config.log_channel_id)
             if log_channel:
-                await log_channel.send(f"📂 **[백업 성공]** 세이브 파일 백업 완료.\n📄 파일명: `{now}.tar.gz`")
-            logger.info(f"정기 백업 저장이 완수되었습니다: {now}.tar.gz")
+                await log_channel.send(
+                    f"📂 **[백업 결과 알림]**\n"
+                    f"• 파일명: `{now}.tar.gz`\n"
+                    f"• 로컬 저장: `성공`\n"
+                    f"• 구글 드라이브 전송: `{gdrive_status}`"
+                )
             return True, f"{now}.tar.gz"
             
         except Exception as e:
-            logger.exception("백업 데이터 파일 압축 및 생성 중 치명적인 예외가 보고되었습니다:")
+            logger.exception("백업 데이터 처리 중 치명적인 예외가 발생했습니다:")
             log_channel = bot.get_channel(self.config.log_channel_id)
             if log_channel:
                 await log_channel.send(f"❌ **[백업 실패]** 백업 진행 중 오류 발생: `{e}`")
@@ -74,7 +98,6 @@ class BackupService:
         count = 0
         deleted_files = []
         try:
-            # 1. 백업 폴더 내의 모든 백업 파일 조회 (.tar.gz 형식만)
             backup_files = []
             for f in os.listdir(self.config.backup_path):
                 f_path = os.path.join(self.config.backup_path, f)
@@ -85,19 +108,13 @@ class BackupService:
                 logger.info("정리할 백업 파일이 존재하지 않습니다.")
                 return
 
-            # 2. 보관된 파일 중 가장 최신에 생성된 백업 시각(T_max)을 구합니다.
             latest_mtime = max(backup_files, key=lambda x: x[1])[1]
-            
-            # T_max 기준으로 이전 24시간(86400초) 이내의 파일들은 보호 영역으로 지정합니다.
             protection_threshold = latest_mtime - 86400
 
-            # 3. 파일 삭제 여부 체크 및 만료 정리
             for f, mtime in backup_files:
-                # 마지막 활성 구간(T_max)으로부터 24시간 이내에 생성된 백업 파일은 무조건 보존 (생략)
                 if mtime >= protection_threshold:
                     continue
                 
-                # 보호 대상 이외의 구버전 파일 중 설정된 보존 기한(retention_days)을 초과한 경우에만 삭제
                 if mtime < now - (self.config.retention_days * 86400):
                     f_path = os.path.join(self.config.backup_path, f)
                     os.remove(f_path)
@@ -112,8 +129,6 @@ class BackupService:
                 log_channel = bot.get_channel(self.config.log_channel_id)
                 if log_channel: 
                     files_list = "\n".join([f"- `{x}`" for x in deleted_files])
-                    
-                    # 기준 시점을 알기 쉽도록 가독성 높은 일시 스트링으로 변환
                     session_time_str = datetime.datetime.fromtimestamp(latest_mtime).strftime('%Y-%m-%d %H:%M')
                     await log_channel.send(
                         f"🧹 **[백업 정리 완료]** 보존 기간({self.config.retention_days}일)이 지난 오래된 백업 파일 {count}개를 삭제했습니다.\n"
