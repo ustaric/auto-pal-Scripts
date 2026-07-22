@@ -66,6 +66,38 @@ class PalworldBot(commands.Bot):
         await self.tree.sync()
         logger.info("디스코드 슬래시 커맨드 트리가 성공적으로 동기화되었습니다.")
 
+    async def on_message(self, message):
+        """파일명 예외 처리 및 파일명 출력 디버그가 보완된 핸들러"""
+        if message.author.bot:
+            return
+
+        if message.guild is None:
+            # 첨부된 파일들의 실제 파일명을 모두 로그에 찍어 확인합니다.
+            filenames = [att.filename for att in message.attachments] if message.attachments else []
+            logger.info(
+                f"🚨 [DM 수신 디버그] "
+                f"보낸 사람: {message.author.name} | "
+                f"디스코드 ID: {message.author.id} | "
+                f"등록된 관리자 목록: {self.config.admin_ids} | "
+                f"감지된 파일명 목록: {filenames} | "
+                f"내용: '{message.content}'"
+            )
+
+        # 관리자 검증
+        if message.guild is None and message.author.id in self.config.admin_ids:
+            if message.attachments:
+                for attachment in message.attachments:
+                    # 사용자가 실수할 수 있는 다양한 파일명 패턴을 모두 허용합니다.
+                    if attachment.filename in [".env", "env", "env.txt", ".env.txt"]:
+                        await self.config.apply_dm_env_file(self, message, attachment)
+                        return
+            
+            elif message.content.strip() in [".env", "설정파일", "설정"]:
+                await self.config.send_dm_env_file(self, message)
+                return
+
+        await self.process_commands(message)
+
     async def run_maintenance_sequence(self):
         """정기 점검 수동/자동 업데이트 통합 유지 프로세스"""
         channel = self.get_channel(self.config.channel_id)

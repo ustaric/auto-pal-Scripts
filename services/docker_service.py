@@ -1,6 +1,5 @@
 import docker
 import asyncio
-from mcrcon import MCRcon
 from utils.logger import logger
 
 class DockerService:
@@ -10,13 +9,31 @@ class DockerService:
 
     async def send_rcon(self, command):
         try:
-            # RCON 연결 차단 방지를 위해 동기 소켓 작업을 별도 스레드풀에서 안전 기동시킵니다.
-            def _run():
-                with MCRcon("127.0.0.1", self.config.rcon_pwd, port=self.config.rcon_port) as mcr:
-                    return mcr.command(command)
-            return await asyncio.to_thread(_run)
-        except Exception as e: 
-            logger.error(f"MCRcon 연결 혹은 명령 실행 실패 (커맨드: {command}): {e}")
+            # -it 옵션은 백그라운드 서비스(TTY가 없는 환경)에서 실행 시 에러를 유발하므로 뺍니다.
+            # Rclone과 마찬가지로 create_subprocess_exec를 사용하여 봇의 메인 스레드 블로킹을 방지합니다.
+            proc = await asyncio.create_subprocess_exec(
+                "docker", "exec", "palworld-server",
+                "rcon-cli",
+                "--address", f"127.0.0.1:{self.config.rcon_port}",
+                "--password", self.config.rcon_pwd,
+                command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            stdout, stderr = await proc.communicate()
+            
+            if proc.returncode == 0:
+                response = stdout.decode("utf-8", errors="ignore").strip()
+                logger.info(f"RCON 명령어 성공 (커맨드: {command}): {response}")
+                return response
+            else:
+                error_msg = stderr.decode("utf-8", errors="ignore").strip()
+                logger.error(f"RCON 명령어 실행 실패 (커맨드: {command}): {error_msg}")
+                return "RCON_ERROR"
+                
+        except Exception as e:
+            logger.error(f"RCON 서브프로세스 기동 중 예외 발생 (커맨드: {command}): {e}")
             return "RCON_ERROR"
 
     def get_container(self, name="palworld-server"):
