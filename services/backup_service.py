@@ -1,9 +1,10 @@
+# services/backup_service.py
 import os
 import time
 import tarfile
 import datetime
-import subprocess
-import asyncio
+import shutil  # 폴더의 재귀적 삭제를 위해 추가
+import asyncio  # <--- 누락되었던 비동기 라이브러리를 정상 추가했습니다.
 from utils.logger import logger
 
 class BackupService:
@@ -40,16 +41,22 @@ class BackupService:
                 except Exception as rcon_err:
                     logger.warning(f"RCON 저장 명령어 전송 실패 (백업 작업을 계속 강행합니다): {rcon_err}")
 
-            # 2. 로컬 압축 파일(.tar.gz) 비동기 생성
+            # 2. 로컬 압축 파일(.tar.gz) 비동기 생성 
             def _create_tar():
+                # [개선] 게임 자체의 내장 backup 폴더는 이중 압축 방지와 
+                # 파일 증발 에러(Errno 2)를 원천 차단하기 위해 압축 대상에서 필터링하여 완전히 제외합니다.
+                def exclude_internal_backup(tarinfo):
+                    if "backup" in tarinfo.name.lower():
+                        return None
+                    return tarinfo
+
                 with tarfile.open(target, "w:gz") as tar:
-                    tar.add(self.config.save_data_path, arcname="Saved")
+                    tar.add(self.config.save_data_path, arcname="Saved", filter=exclude_internal_backup)
             await asyncio.to_thread(_create_tar)
             
             logger.info(f"로컬 백업 파일 생성 완료: {target}")
 
-            # 3. Rclone을 사용한 구글 드라이브 'backup' 폴더 업로드 (비동기 서브프로세스 실행)
-            # 봇의 메인 루프가 블로킹되지 않도록 create_subprocess_exec를 사용합니다.
+            # 3. Rclone을 사용한 구글 드라이브 'backup' 폴더 업로드
             logger.info("Rclone 구글 드라이브 업로드를 시작합니다...")
             rclone_proc = await asyncio.create_subprocess_exec(
                 'rclone', 'copy', target, 'gdrive:backup',
@@ -57,7 +64,6 @@ class BackupService:
                 stderr=asyncio.subprocess.PIPE
             )
             
-            # 업로드 프로세스가 끝날 때까지 비동기 대기
             stdout, stderr = await rclone_proc.communicate()
             
             if rclone_proc.returncode == 0:
@@ -98,6 +104,7 @@ class BackupService:
         count = 0
         deleted_files = []
         try:
+            # 1. 봇이 생성한 호스트 측 백업 파일 조회 및 정리 (.tar.gz)
             backup_files = []
             for f in os.listdir(self.config.backup_path):
                 f_path = os.path.join(self.config.backup_path, f)
@@ -121,20 +128,46 @@ class BackupService:
                     count += 1
                     deleted_files.append(f)
 
-            if count > 0:
+            # 2. 게임 서버가 세이브 폴더 내부에 남긴 자체 구버전 백업 폴더들도 동일 기한 조건으로 추적 소거합니다.
+            internal_clean_count = 0
+            save_games_path = os.path.join(self.config.save_data_path, "SaveGames", "0")
+            
+            if os.path.exists(save_games_path):
+                for world_id in os.listdir(save_games_path):
+                    world_path = os.path.join(save_games_path, world_id)
+                    if os.path.isdir(world_path):
+                        for sub_type in ["local", "world"]:
+                            internal_backup_dir = os.path.join(world_path, "backup", sub_type)
+                            if os.path.exists(internal_backup_dir):
+                                for temp_folder in os.listdir(internal_backup_dir):
+                                    folder_path = os.path.join(internal_backup_dir, temp_folder)
+                                    if os.path.isdir(folder_path):
+                                        folder_mtime = os.stat(folder_path).st_mtime
+                                        
+                                        if folder_mtime < now - (self.config.retention_days * 86400):
+                                            try:
+                                                shutil.rmtree(folder_path)
+                                                internal_clean_count += 1
+                                            except Exception as clean_err:
+                                                logger.error(f"내장 백업 임시 폴더 삭제 실패 ({temp_folder}): {clean_err}")
+
+            if count > 0 or internal_clean_count > 0:
                 data = self.status_service.get_status()
                 data["last_cleanup"] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
                 self.status_service.save_status(data)
                 
                 log_channel = bot.get_channel(self.config.log_channel_id)
                 if log_channel: 
-                    files_list = "\n".join([f"- `{x}`" for x in deleted_files])
+                    files_list = "\n".join([f"- `{x}`" for x in deleted_files]) if deleted_files else "없음"
                     session_time_str = datetime.datetime.fromtimestamp(latest_mtime).strftime('%Y-%m-%d %H:%M')
                     await log_channel.send(
-                        f"🧹 **[백업 정리 완료]** 보존 기간({self.config.retention_days}일)이 지난 오래된 백업 파일 {count}개를 삭제했습니다.\n"
-                        f"⚠️ **안내**: 가장 최근 백업({session_time_str}) 시점으로부터 이전 24시간 동안 생성된 모든 백업본은 보존 정책에 따라 삭제 대상에서 자동 제외되었습니다.\n"
-                        f"🗑️ **삭제 목록:**\n{files_list}"
+                        f"🧹 **[백업 및 디스크 정리 완료]**\n"
+                        f"• 보존 기간({self.config.retention_days}일) 초과로 정리 완료.\n"
+                        f"• 제거된 봇 백업 파일: `{count}개`\n"
+                        f"• 소거된 서버 내장 백업 폴더: `{internal_clean_count}개` (디스크 공간 추가 확보 완료)\n"
+                        f"• 안내: 가장 최근 백업({session_time_str}) 기준 이전 24시간 동안 생성된 파일들은 안전 보존 정책에 의해 보존되었습니다.\n"
+                        f"🗑️ **삭제된 봇 백업 목록:**\n{files_list}"
                     )
-                logger.info(f"보존 기한이 초과된 구버전 백업 {count}개가 자동 디스크 정리되었습니다.")
+                logger.info(f"보존 기한이 초과된 구버전 백업 {count}개 및 내장 백업 폴더 {internal_clean_count}개가 디스크에서 완전 정리되었습니다.")
         except Exception as e:
             logger.exception(f"오래된 백업 디스크 정리 중 실패 오류: {e}")
