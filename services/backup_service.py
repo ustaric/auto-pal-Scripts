@@ -99,10 +99,13 @@ class BackupService:
             return False, None
 
     async def delete_old_backups(self, bot):
-        """기한이 지난 백업을 정리하되, 가장 최신 백업 시점을 기준으로 이전 24시간 동안의 모든 백업 파일은 안전 보존합니다."""
+        """기한이 지난 백업을 정리하되, 가장 최신 백업 시점을 기준으로 이전 24시간 동안의 모든 백업 파일은 안전 보존합니다.
+        또한 구글 드라이브 원격지의 오래된 백업 파일도 명시적으로 정리합니다."""
         now = time.time()
         count = 0
         deleted_files = []
+        gdrive_deleted_status = "수행되지 않음"
+        
         try:
             # 1. 봇이 생성한 호스트 측 백업 파일 조회 및 정리 (.tar.gz)
             backup_files = []
@@ -151,7 +154,33 @@ class BackupService:
                                             except Exception as clean_err:
                                                 logger.error(f"내장 백업 임시 폴더 삭제 실패 ({temp_folder}): {clean_err}")
 
-            if count > 0 or internal_clean_count > 0:
+            # 3. 구글 드라이브(gdrive:backup)의 만료된 백업 파일 명시적 정리 (--min-age 사용)
+            try:
+                logger.info("구글 드라이브의 만료된 백업 파일 정리를 시작합니다...")
+                # self.config.retention_days 기준을 적용하여 오래된 .tar.gz 파일만 안전하게 매칭하여 지웁니다.
+                rclone_del_proc = await asyncio.create_subprocess_exec(
+                    'rclone', 'delete', 'gdrive:backup',
+                    '--min-age', f"{self.config.retention_days}d",
+                    '--include', '*.tar.gz',
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                
+                del_stdout, del_stderr = await rclone_del_proc.communicate()
+                
+                if rclone_del_proc.returncode == 0:
+                    logger.info("구글 드라이브 원격 정리 명령 수행 완료")
+                    gdrive_deleted_status = "성공(만료 파일 소거)"
+                else:
+                    del_err_msg = del_stderr.decode().strip()
+                    logger.error(f"구글 드라이브 백업 정리 중 Rclone 오류: {del_err_msg}")
+                    gdrive_deleted_status = f"실패 ({del_err_msg})"
+            except Exception as rclone_del_err:
+                logger.error(f"구글 드라이브 백업 정리 명령 처리 실패: {rclone_del_err}")
+                gdrive_deleted_status = f"오류 발생 ({rclone_del_err})"
+
+            # 4. 정리 작업 진행 결과 기록 및 알림
+            if count > 0 or internal_clean_count > 0 or "성공" in gdrive_deleted_status:
                 data = self.status_service.get_status()
                 data["last_cleanup"] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
                 self.status_service.save_status(data)
@@ -163,11 +192,12 @@ class BackupService:
                     await log_channel.send(
                         f"🧹 **[백업 및 디스크 정리 완료]**\n"
                         f"• 보존 기간({self.config.retention_days}일) 초과로 정리 완료.\n"
-                        f"• 제거된 봇 백업 파일: `{count}개`\n"
+                        f"• 제거된 로컬 백업 파일: `{count}개`\n"
                         f"• 소거된 서버 내장 백업 폴더: `{internal_clean_count}개` (디스크 공간 추가 확보 완료)\n"
+                        f"• 구글 드라이브 정리 상태: `{gdrive_deleted_status}`\n"
                         f"• 안내: 가장 최근 백업({session_time_str}) 기준 이전 24시간 동안 생성된 파일들은 안전 보존 정책에 의해 보존되었습니다.\n"
-                        f"🗑️ **삭제된 봇 백업 목록:**\n{files_list}"
+                        f"🗑️ **삭제된 로컬 백업 목록:**\n{files_list}"
                     )
-                logger.info(f"보존 기한이 초과된 구버전 백업 {count}개 및 내장 백업 폴더 {internal_clean_count}개가 디스크에서 완전 정리되었습니다.")
+                logger.info(f"보존 기한이 초과된 구버전 백업 {count}개 및 내장 백업 폴더 {internal_clean_count}개가 디스크에서 정리되었으며, 구글 드라이브 원격 정리가 진행되었습니다.")
         except Exception as e:
             logger.exception(f"오래된 백업 디스크 정리 중 실패 오류: {e}")
